@@ -1,0 +1,951 @@
+---
+title: "Kaggle AMES House Prices Solution"
+author: "Anup Kumar Jana"
+date: "August 14, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Predictive Analytics on AMES Housing Data
+Ames Housing Authority is a public housing agency that serves the city of Ames, Iowa, US. It helps provide decent and safe rental housing for eligible low-income families, the elderly, and persons with disabilities
+The housing authority has collected 79 assessment parameters which describes every aspect of residential homes in Ames. These variables focus on the quality and quantity of the physical attributes of a property. Most of the variables are exactly the type of information that a typical home buyer would want to know about a potential property. 
+
+Problem Statement: Predict Home Sale Price for the Test Data Set with the lowest possible error.
+
+## 1 Loading and Exploring Data
+### 1.1 Loading libraries required and reading the data into R
+Loading R packages used besides base R.
+
+```{r }
+options(warn = -1) # Suppress Warnings
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(corrplot)
+library(caret)
+library(gridExtra)
+library(scales)
+library(Rmisc)
+library(ggrepel)
+library(randomForest)
+library(psych)
+library(xgboost)
+
+# Load the Housing dataset - This is training dataset through which we will build the model
+setwd("C:/Users/ajana/Desktop/Kaggle-Competitions/AMES-House-Prices/") # setting dataset directory
+trainData <- read.csv("house_prices_train.csv", stringsAsFactors = F)
+testData <- read.csv("house_prices_test.csv", stringsAsFactors = F)
+```
+
+### 1.2 Data size and structure
+```{r }
+dim(trainData)
+
+str(trainData[,c(1:10, 81)]) #display first 10 variables and the response variable
+
+#Getting rid of the IDs but keeping the test IDs in a vector. These are needed to compose the submission file
+testLabels <- testData$Id
+testData$Id <- NULL
+trainData$Id <- NULL
+
+trainingRowIndex <- nrow(trainData)
+
+testData$SalePrice <- NA
+allData <- rbind(trainData, testData)
+
+dim(allData)
+```
+
+Without the Id's, the dataframe consists of 79 predictors and response variable SalePrice.
+
+## 2 - Exploratory Data Analysis (EDA) - Numeric Features
+### 2.1 - Response Variable - SalePrice
+```{r }
+ggplot(data=allData[!is.na(allData$SalePrice),], aes(x=SalePrice)) +
+        geom_histogram(fill="blue", binwidth = 10000) +
+        scale_x_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+
+summary(allData$SalePrice)
+```
+
+### 2.2 - Numeric Features Correlations with SalePrice
+To get a feel for the dataset, let's first see which numeric variables have a high correlation with response variable SalePrice.
+```{r }
+numericVars <- which(sapply(allData, is.numeric)) #index vector numeric variables
+numericVarNames <- names(numericVars) #saving names vector for use later on
+cat('There are', length(numericVars), 'numeric variables')
+
+all_numVar <- allData[, numericVars]
+cor_numVar <- cor(all_numVar, use="pairwise.complete.obs") #correlations of all numeric variables
+
+# sort on decreasing correlations with SalePrice
+cor_sorted <- as.matrix(sort(cor_numVar[,'SalePrice'], decreasing = TRUE))
+# select only high corelations
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.5)))
+cor_numVar <- cor_numVar[CorHigh, CorHigh]
+
+corrplot.mixed(cor_numVar, tl.col="black", tl.pos = "lt")
+```
+Altogether, there are 10 numeric variables with a correlation of at least 0.5 with SalePrice. All those correlations are positive.. It also becomes clear the multicollinearity is an issue. For example: the correlation between GarageCars and GarageArea is very high (0.89), and both have similar (high) correlations with SalePrice. The other 6 six variables with a correlation higher than 0.5 with SalePrice.
+
+### 2.3 - Overall Quality against SalePrice
+Overall Quality has the highest correlation with SalePrice among the numeric variables (0.79). It rates the overall material and finish of the house on a scale from 1 (very poor) to 10 (very excellent).
+```{r }
+ggplot(data=allData[!is.na(allData$SalePrice),], aes(x=factor(OverallQual), y=SalePrice))+
+        geom_boxplot(col='blue') + labs(x='Overall Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+```
+
+### 2.4 - Above Grade Living Area against SalePrice
+The numeric variable with the second highest correlation with SalesPrice is the Above Grade Living Area. This make a lot of sense; big houses are generally more expensive.
+```{r }
+ggplot(data=allData[!is.na(allData$SalePrice),], aes(x=GrLivArea, y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(allData$GrLivArea[!is.na(allData$SalePrice)]>4500, rownames(allData), '')))
+```
+Especially the two houses with really big living areas and low SalePrices seem outliers (houses 524 and 1299. Let's keep houses 1299 and 524 in mind as prime candidates to take out as outliers.
+```{r }
+allData[c(524, 1299), c('SalePrice', 'GrLivArea', 'OverallQual')]
+```
+
+## 3 - Handle Missing Data
+### 3.1 - Check Completeness of Data
+```{r }
+NAcol <- which(colSums(is.na(allData)) > 0)
+sort(colSums(sapply(allData[NAcol], is.na)), decreasing = TRUE)
+cat('There are', length(NAcol), 'columns with missing values')
+```
+Let's ignore SalePrice with 1459 NAs which match the size of the test set perfectly. This means we need to fix NAs in 34 predictor variables.
+
+### 3.2 - Imputing Missing Data {.tabset}
+Let's go through missing data until they all are fixed. However, there are other features that actually forms a group with other, and we can deal with them as a group. For instance, there are multiple features that relate to Pool, Garage, and Basement. From data description, we know that NAs are usually "No feature" or quality / condition data is not available. So, we will impute the missing values accordingly.
+
+#### 3.2.1 - Pool Features
+From the data description of PoolQC feature we know that, Ex - Excellent, Gd - Good, TA	- Average/Typical, Fa	- Fair & NA - No Pool. So, we need to just assign 'No Pool' to the NAs. We will use 'None' values for our simplicity.
+```{r }
+allData$PoolQC[is.na(allData$PoolQC)] <- 'None'
+```
+However, there is a another feature  PoolArea that relates to Pools. Let's look them together and handle accordingly.
+Also, let's observe the co-relation of Pool Quality against SalePrice
+```{r }
+allData[allData$PoolArea>0 & allData$PoolQC=='None', c('PoolArea', 'PoolQC', 'OverallQual')]
+
+allData$PoolQC[2421] <- 2; allData$PoolQC[2504] <- 3; allData$PoolQC[2600] <- 2
+
+ggplot(allData[!is.na(allData$SalePrice),], aes(x=PoolQC, y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue')+
+        scale_y_continuous(breaks= seq(0, 500000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+We can observe that as the quality increases, the median SalePrice increase. Therefore, we will convert them into ordinal values.
+
+#### 3.2.2 - Miscellaneous Feature
+From the data description of MiscFeature feature we know that, Elev - Elevator, Gar2 - 2nd Garage, Othr - Other, Shed - Shed (over 100 SF), TenC - Tennis Court & NA - None. So, we need to assign 'None' to NAs.
+Let's observe the co-relation of MiscFeature against median SalePrice.
+```{r }
+allData$MiscFeature[is.na(allData$MiscFeature)] <- 'None'
+
+ggplot(allData[!is.na(allData$SalePrice),], aes(x=MiscFeature, y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') +
+        scale_y_continuous(breaks= seq(0, 500000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+When looking at the frequencies, having a shed probably means 'no Garage', which would explain the lower sales price for Shed. Also, a house with a Tennis court is expensive, however, there is only one house with a tennis court which would ideally won't help us in building the model as it won't be there in both test & train set and frequency is too low against overall population.
+
+#### 3.2.3 - Alley Feature
+From the data description of Alley feature we know that, Grvl - Gravel, Pave - Paved & NA - No alley access. So, we need to assign 'None' to NAs. Also, let's see co-relation against median SalePrice.
+```{r }
+allData$Alley[is.na(allData$Alley)] <- 'None'
+
+ggplot(allData[!is.na(allData$SalePrice),], aes(x=Alley, y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue')+
+        scale_y_continuous(breaks= seq(0, 200000, by=50000), labels = comma)+
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+#### 3.2.4 - Fence Feature
+From the data description of Fence feature we know that, GdPrv - Good Privacy, MnPrv - Minimum Privacy, GdWo - Good Wood, MnWw - Minimum Wood/Wire, NA - No Fence. So, we need to assign 'None' to NAs. Also, let's see co-relation against median SalePrice.
+```{r }
+allData$Fence[is.na(allData$Fence)] <- 'None'
+
+ggplot(allData[!is.na(allData$SalePrice),], aes(x=Fence, y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue')+
+        scale_y_continuous(breaks= seq(0, 200000, by=50000), labels = comma)+
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+So, we don't see any pattern between Fence & SalePrice, hence, we will convert them factor insteam of ordinal values.
+
+#### 3.2.5 - Fireplace Features
+From the data description of Fireplace Quality feature we know that, Ex - Excellent, Gd - Good - Masonry, TA - Average, Fa - Fair, Po - Poor, NA - No Fireplace. So, we need to assign 'None' to NAs. Also, let's see co-relation against median SalePrice.
+```{r }
+allData$FireplaceQu[is.na(allData$FireplaceQu)] <- 'None'
+
+ggplot(allData[!is.na(allData$SalePrice),], aes(x=FireplaceQu, y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue')+
+        scale_y_continuous(breaks= seq(0, 500000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+We can observe similar pattern as other quality features. Therefore, we will convert them into ordinal values.
+
+#### 3.2.6 - Lot Features
+The most reasonable imputation seems to take the median per neigborhood.
+```{r }
+ggplot(allData[!is.na(allData$LotFrontage),], aes(x=as.factor(Neighborhood), y=LotFrontage)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+for (i in 1:nrow(allData)){
+  if(is.na(allData$LotFrontage[i])){
+    allData$LotFrontage[i] <- as.integer(median(allData$LotFrontage[allData$Neighborhood==allData$Neighborhood[i]], na.rm=TRUE)) 
+  }
+}
+```
+
+#### 3.2.7 - Garage Features
+Let's replace GarageYrBlt (Year of Garage Built) with the values in YearBuilt.
+```{r }
+allData$GarageYrBlt[is.na(allData$GarageYrBlt)] <- allData$YearBuilt[is.na(allData$GarageYrBlt)]
+
+```
+From the data description of Garage Type feature we know that, 
+   2Types   More than one type of garage
+   Attchd   Attached to home
+   Basment  Basement Garage
+   BuiltIn  Built-In (Garage part of house - typically has room above garage)
+   CarPort  Car Port
+   Detchd   Detached from home
+   NA   No Garage.
+So, we need to assign 'None' to NAs.
+```{r }
+allData$GarageType[is.na(allData$GarageType)] <- 'None'
+
+```
+Similarly, let's handle other Garage features such as GarageFinish, GarageQual & GarageCond. So, we need to assign 'None' to NAs.
+```{r }
+allData$GarageFinish[is.na(allData$GarageFinish)] <- 'None'
+allData$GarageQual[is.na(allData$GarageQual)] <- 'None'
+allData$GarageCond[is.na(allData$GarageCond)] <- 'None'
+```
+
+#### 3.2.8 - Basement Features
+Features such as BsmtQual, BsmtCond, BsmtExposure, BsmtFinType1 & BsmtFinType2 can be replaced by 'None' values based on the data description
+```{r }
+allData$BsmtQual[is.na(allData$BsmtQual)] <- 'None'
+allData$BsmtCond[is.na(allData$BsmtCond)] <- 'None'
+allData$BsmtExposure[is.na(allData$BsmtExposure)] <- 'None'
+allData$BsmtFinType1[is.na(allData$BsmtFinType1)] <- 'None'
+allData$BsmtFinType2[is.na(allData$BsmtFinType2)] <- 'None'
+```
+
+Features such as BsmtFullBath, BsmtHalfBath, BsmtFinSF1, BsmtFinSF2, BsmtUnfSF & TotalBsmtSF can be replaced by 0 value as we can infer based on None Basement Quality they are not present.
+```{r }
+allData[(is.na(allData$BsmtFullBath)|is.na(allData$BsmtHalfBath)|is.na(allData$BsmtFinSF1)|is.na(allData$BsmtFinSF2)|is.na(allData$BsmtUnfSF)|is.na(allData$TotalBsmtSF)), c('BsmtQual', 'BsmtFullBath', 'BsmtHalfBath', 'BsmtFinSF1', 'BsmtFinSF2', 'BsmtUnfSF', 'TotalBsmtSF')]
+
+allData$BsmtFullBath[is.na(allData$BsmtFullBath)] <- 0
+allData$BsmtHalfBath[is.na(allData$BsmtHalfBath)] <- 0
+allData$BsmtFinSF1[is.na(allData$BsmtFinSF1)] <- 0
+allData$BsmtFinSF2[is.na(allData$BsmtFinSF2)] <- 0
+allData$BsmtUnfSF[is.na(allData$BsmtUnfSF)] <- 0
+allData$TotalBsmtSF[is.na(allData$TotalBsmtSF)] <- 0
+```
+
+#### 3.2.9 - Mansonry Features
+We need to look into Mansonry features together, as if MasVnrArea exists then MasVnrType should be present. Remianing observations we can replace null values with 'None' or 0 value as per data description.
+```{r }
+sort(-table(allData$MasVnrType))
+allData[is.na(allData$MasVnrType) & !is.na(allData$MasVnrArea), c('MasVnrType', 'MasVnrArea')]
+
+allData$MasVnrType[2611] <- names(sort(-table(allData$MasVnrType)))[2] #taking the 2nd value as the 1st is 'None'
+allData[2611, c('MasVnrType', 'MasVnrArea')]
+
+allData$MasVnrType[is.na(allData$MasVnrType)] <- 'None'
+allData$MasVnrArea[is.na(allData$MasVnrArea)] <- 0
+```
+
+#### 3.2.10 - Ramining Features (Less than 5 null values)
+For reamining features such as MSZoning, KitchenQual, Functional, Exterior1st, Exterior2nd, Utilities, Electrical, GarageCars, GarageArea & SaleType which has less than 5 null values, we can replace them with most common values for categorical feature and 0 for numerical features.
+```{r }
+allData$MSZoning[is.na(allData$MSZoning)] <- names(sort(-table(allData$MSZoning)))[1]
+allData$KitchenQual[is.na(allData$KitchenQual)] <- names(sort(-table(allData$KitchenQual)))[1]
+allData$Utilities[is.na(allData$Utilities)] <- names(sort(-table(allData$Utilities)))[1]
+allData$Functional[is.na(allData$Functional)] <- names(sort(-table(allData$Functional)))[1]
+allData$Exterior1st[is.na(allData$Exterior1st)] <- names(sort(-table(allData$Exterior1st)))[1]
+allData$Exterior2nd[is.na(allData$Exterior2nd)] <- names(sort(-table(allData$Exterior2nd)))[1]
+allData$Electrical[is.na(allData$Electrical)] <- names(sort(-table(allData$Electrical)))[1]
+allData$SaleType[is.na(allData$SaleType)] <- names(sort(-table(allData$SaleType)))[1]
+
+allData$GarageCars[is.na(allData$GarageCars)] <- 0
+allData$GarageArea[is.na(allData$GarageArea)] <- 0
+```
+
+### 3.3 - Check Missing Data After Null Values Treatment
+```{r }
+NAcol <- which(colSums(is.na(allData)) > 0)
+sort(colSums(sapply(allData[NAcol], is.na)), decreasing = TRUE)
+```
+
+## 4 - Label Encoding of Categorical / Character Features
+We have taken care of all NA values, now let's convert categorical / charater features into numerical for buidling our model. We have seen above carious categorical features, so, let's handle them in groups.
+
+### 4.1 - Handling Ordinal Features {.tabset}
+We have seen many features where values are oridinal such as quality, condition, exposure, finished area, etc. So, let's convert such features to ordinal values accordingly. Let's create a generic function to map categorical values to ordinal values.
+```{r }
+map.values <- function(col.list, map.list, df){
+  for (col in col.list){
+    df[[col]] <- as.integer(revalue(df[,col], map.list))
+  }
+  return(df)
+}
+```
+
+#### 4.1.1 - Quality & Condition Features
+We already obaserved above that quality and condition features are ordinal, as the quality increases the median house SalePrice increases. Hence, we will convert these features into oridnal values.
+```{r }
+qual.cols <- c('ExterQual', 'ExterCond', 'GarageQual', 'GarageCond', 'KitchenQual', 'HeatingQC', 'BsmtQual', 'BsmtCond', 'FireplaceQu', 'PoolQC')
+qual.list <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+allData <- map.values(qual.cols, qual.list, allData)
+```
+
+#### 4.2.2 - Basement Features
+Based on the data description of Basement features, we can convert them to ordinal values.
+Basement Finished Type:
+   GLQ  Good Living Quarters
+   ALQ  Average Living Quarters
+   BLQ  Below Average Living Quarters   
+   Rec  Average Rec Room
+   LwQ  Low Quality
+   Unf  Unfinshed
+   NA   No Basement
+Basement Exposure:
+   Gd   Good Exposure
+   Av   Average Exposure (split levels or foyers typically score average or above)  
+   Mn   Mimimum Exposure
+   No   No Exposure
+   NA   No Basement
+```{r }
+bsmt.fin.cols <- c('BsmtFinType1','BsmtFinType2')
+bsmt.fin.list <- c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)
+allData <- map.values(bsmt.fin.cols, bsmt.fin.list, allData)
+
+bsmt.exp.list <- c('None'=0, 'No'=1, 'Mn'=2, 'Av'=3, 'Gd'=4)
+allData <- map.values('BsmtExposure', bsmt.exp.list, allData)
+```
+
+#### 4.2.3 - Masonry Type Feature
+Let's look into the co-relation of Masonry Type Feature against median SalePrice and convert them to ordinal values accordingly.
+```{r }
+allData[!is.na(allData$SalePrice),] %>% group_by(MasVnrType) %>% summarise(median = median(SalePrice), counts=n()) %>% arrange(median)
+```
+We can notice that None & BrkCmn has same medial SalePrice values, hence, we will treat them same & we can convert them to ordinal values as there is corelation against median SalePrice.
+```{r }
+masvnrtyp.list <- c('None'=0, 'BrkCmn'=0, 'BrkFace'=1, 'Stone'=2)
+allData <- map.values('MasVnrType', masvnrtyp.list, allData)
+```
+
+#### 4.2.4 - Lot Features
+Based on the data description of Lot Shape feature, we can convert them to ordinal values.
+Lot Shape:
+   Reg  Regular 
+   IR1  Slightly irregular
+   IR2  Moderately Irregular
+   IR3  Irregular
+```{r }
+lot.shape.list <- c('IR3'=0, 'IR2'=1, 'IR1'=2, 'Reg'=3)
+allData <- map.values('LotShape', lot.shape.list, allData)
+```
+Let's look into the co-relation of Lot config Feature against median SalePrice.
+```{r }
+allData[!is.na(allData$SalePrice),] %>% group_by(LotConfig) %>% summarise(median = median(SalePrice), counts=n()) %>% arrange(median)
+```
+We can't observe any co-relation with SalePrice and hence, we will convert them to factors
+```{r }
+allData$LotConfig <- as.factor(allData$LotConfig)
+```
+
+#### 4.2.5 - Functional Feature
+Based on the data description of Functional features, we can convert them to ordinal values.
+   Typ  Typical Functionality
+   Min1 Minor Deductions 1
+   Min2 Minor Deductions 2
+   Mod  Moderate Deductions
+   Maj1 Major Deductions 1
+   Maj2 Major Deductions 2
+   Sev  Severely Damaged
+   Sal  Salvage only
+```{r }
+func.list <- c('Sal'=0, 'Sev'=1, 'Maj2'=2, 'Maj1'=3, 'Mod'=4, 'Min2'=5, 'Min1'=6, 'Typ'=7)
+allData <- map.values('Functional', func.list, allData)
+```
+
+#### 4.2.6 - Garage Features
+Based on the data description of Garage Finish features, we can convert them to ordinal values.
+   Fin  Finished
+   RFn  Rough Finished  
+   Unf  Unfinished
+   NA   No Garage  
+```{r }
+grg.fin.list <- c('None'=0, 'Unf'=1, 'RFn'=2, 'Fin'=3)
+allData <- map.values('GarageFinish', grg.fin.list, allData)
+```
+Let's look into the co-relation of Garage Type Feature against median SalePrice and handle accordingly.
+```{r }
+allData[!is.na(allData$SalePrice),] %>% group_by(GarageType) %>% summarise(median = median(SalePrice), counts=n()) %>% arrange(median)
+```
+We can't observe any co-relation with SalePrice and hence, we will convert them to factors
+```{r }
+allData$GarageType <- as.factor(allData$GarageType)
+```
+
+#### 4.2.7 - Condition Features
+Let's look into the co-relation of Condition Features against median SalePrice and convert them to ordinal values accordingly.
+```{r }
+allData[!is.na(allData$SalePrice),] %>% group_by(Condition1) %>% summarise(median = median(SalePrice), counts=n()) %>% arrange(median)
+allData[!is.na(allData$SalePrice),] %>% group_by(Condition2) %>% summarise(median = median(SalePrice), counts=n()) %>% arrange(median)
+```
+We can't observe any co-relation with SalePrice and hence, we will convert them to factors
+```{r }
+allData$Condition1 <- as.factor(allData$Condition1)
+allData$Condition2 <- as.factor(allData$Condition2)
+```
+
+#### 4.2.8 - Miscellaneous Feature
+Let's look into the co-relation of Miscellaneous Features against median SalePrice and convert them to ordinal values accordingly.
+```{r }
+allData[!is.na(allData$SalePrice),] %>% group_by(MiscFeature) %>% summarise(median = median(SalePrice), counts=n()) %>% arrange(median)
+```
+We can't observe any co-relation with SalePrice and hence, we will convert them to factors
+```{r }
+allData$MiscFeature <- as.factor(allData$MiscFeature)
+```
+
+#### 4.2.9 - Fence Feature
+Let's look into the co-relation of Fence Features against median SalePrice and convert them to ordinal values accordingly.
+```{r }
+allData[!is.na(allData$SalePrice),] %>% group_by(Fence) %>% summarise(median = median(SalePrice), counts=n()) %>% arrange(median)
+```
+We can't observe any co-relation with SalePrice and hence, we will convert them to factors
+```{r }
+allData$Fence <- as.factor(allData$Fence)
+```
+
+#### 4.2.10 - Utilities Feature
+There is only 1 'NoSeWa' value and rest are 'AllPub' which makes the feature useless for prediction. So,let's remove it from the dataset.
+```{r }
+table(allData$Utilities)
+allData$Utilities <- NULL
+```
+
+#### 4.2.11 - Year and Month Sold Feature
+Let's convert YrSold into a factor before modeling, but as I need the numeric version of YrSold to create an Age variable. Month Sold is also an Integer variable, let's convert MoSold values back into factors.
+```{r }
+allData$MoSold <- as.factor(allData$MoSold)
+
+ys <- ggplot(allData[!is.na(allData$SalePrice),], aes(x=as.factor(YrSold), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue')+
+        scale_y_continuous(breaks= seq(0, 800000, by=25000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..)) +
+        coord_cartesian(ylim = c(0, 200000)) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #dashed line is median SalePrice
+
+ms <- ggplot(allData[!is.na(allData$SalePrice),], aes(x=MoSold, y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue')+
+        scale_y_continuous(breaks= seq(0, 800000, by=25000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..)) +
+        coord_cartesian(ylim = c(0, 200000)) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #dashed line is median SalePrice
+
+grid.arrange(ys, ms, widths=c(1,2))
+```
+
+#### 4.2.12 - MSSubClass Feature
+MSSubClass: Identifies the type of dwelling involved in the sale. Based on data description, these classes are coded as numbers, but really are categories.
+```{r }
+allData$MSSubClass <- as.factor(allData$MSSubClass)
+
+sub.class.list <- c('20'='1 story 1946+', '30'='1 story 1945-', '40'='1 story unf attic', '45'='1,5 story unf', '50'='1,5 story fin', '60'='2 story 1946+', '70'='2 story 1945-', '75'='2,5 story all ages', '80'='split/multi level', '85'='split foyer', '90'='duplex all style/age', '120'='1 story PUD 1946+', '150'='1,5 story PUD all', '160'='2 story PUD 1946+', '180'='PUD multilevel', '190'='2 family conversion')
+
+allData$MSSubClass <- revalue(allData$MSSubClass, sub.class.list)
+```
+
+#### 4.2.13 - Remaining Features
+Based on the data description of remaining features, they don't have any ordinality values, hence, let's convert them to ordinal values.
+```{r }
+allData$MSZoning <- as.factor(allData$MSZoning)
+allData$Exterior1st <- as.factor(allData$Exterior1st)
+allData$Exterior2nd <- as.factor(allData$Exterior2nd)
+allData$Electrical <- as.factor(allData$Electrical)
+allData$SaleType <- as.factor(allData$SaleType)
+allData$SaleCondition <- as.factor(allData$SaleCondition)
+allData$Foundation <- as.factor(allData$Foundation)
+allData$Heating <- as.factor(allData$Heating)
+allData$RoofStyle <- as.factor(allData$RoofStyle)
+allData$RoofMatl <- as.factor(allData$RoofMatl)
+allData$LandContour <- as.factor(allData$LandContour)
+allData$BldgType <- as.factor(allData$BldgType)
+allData$HouseStyle <- as.factor(allData$HouseStyle)
+allData$Neighborhood <- as.factor(allData$Neighborhood)
+allData$Alley <- as.factor(allData$Alley)
+
+cent.air.list <- c('N'=0, 'Y'=1)
+allData <- map.values('CentralAir', cent.air.list, allData)
+
+land.slope.list <- c('Sev'=0, 'Mod'=1, 'Gtl'=2)
+allData <- map.values('LandSlope', land.slope.list, allData)
+
+street.list <- c('Grvl'=0, 'Pave'=1)
+allData <- map.values('Street', street.list, allData)
+
+pave.drv.list <- c('N'=0, 'P'=1, 'Y'=2)
+allData <- map.values('PavedDrive', pave.drv.list, allData)
+#str(allData)
+```
+
+## 5 - Exploratory Data Analysis (EDA) & Feature Engineerig
+I will create few functions for our EDA purposes.
+```{r }
+# helper function for plotting categoric data for easier data visualization
+plot.categoric <- function(cols, df){
+  for (col in cols) {
+    order.cols <- names(sort(table(allData[,col]), decreasing = TRUE))
+  
+    num.plot <- qplot(df[,col]) +
+      geom_bar(fill = 'cornflowerblue') +
+      geom_text(aes(label = ..count..), stat='count', vjust=-0.5) +
+      theme_minimal() +
+      scale_y_continuous(limits = c(0,max(table(df[,col]))*1.1)) +
+      scale_x_discrete(limits = order.cols) +
+      xlab(col) +
+      theme(axis.text.x = element_text(angle = 30, size=12))
+  
+    print(num.plot)
+  }
+}
+
+# function that groups a column by its features and returns the mdedian saleprice for each unique feature. 
+group.df <- allData[!is.na(allData$SalePrice),]
+
+group.mean.prices <- function(col) {
+  grp.mean.tbl <- group.df[,c(col, 'SalePrice', 'OverallQual')] %>%
+    group_by_(col) %>%
+    dplyr::summarise(mean.Quality = round(mean(OverallQual),2),
+      mean.Price = mean(SalePrice), n = n()) %>%
+    arrange(mean.Quality)
+    
+  print(qplot(x=reorder(grp.mean.tbl[[col]], -grp.mean.tbl[['mean.Price']]), y=grp.mean.tbl[['mean.Price']]) +
+    geom_bar(stat='identity', fill='cornflowerblue') +
+    theme_minimal() + labs(x=col, y='Mean SalePrice') +
+    scale_y_continuous(breaks= seq(0, 500000, by=100000), labels = comma)+
+    theme(axis.text.x = element_text(angle = 45)))
+  
+#  return(data.frame(group.mean.table))
+}
+
+group.median.prices <- function(col) {
+  grp.median.tbl <- group.df[,c(col, 'SalePrice', 'OverallQual')] %>%
+    group_by_(col) %>%
+    dplyr::summarise(median.Quality = round(median(OverallQual),2),
+      median.Price = median(SalePrice), n = n()) %>%
+    arrange(median.Quality)
+    
+  print(qplot(x=reorder(grp.median.tbl[[col]], -grp.median.tbl[['median.Price']]), y=grp.median.tbl[['median.Price']]) +
+    geom_bar(stat='identity', fill='cornflowerblue') +
+    theme_minimal() + labs(x=col, y='Median SalePrice') +
+    scale_y_continuous(breaks= seq(0, 500000, by=100000), labels = comma)+
+    theme(axis.text.x = element_text(angle = 45)))
+  
+#  return(data.frame(group.median.table))
+}
+```
+
+### 5.1 - Correlation of numeric Features
+Now, that we have handled all the null values and converted them to either numeric or factorial features, let's agian look into the significant correlation of these features against SalePrice 
+```{r }
+numericVars <- which(sapply(allData, is.numeric)) #index vector numeric variables
+factorVars <- which(sapply(allData, is.factor)) #index vector factor variables
+cat('There are', length(numericVars), 'numeric variables, and', length(factorVars), 'categoric variables')
+
+all_numVar <- allData[, numericVars]
+cor_numVar <- cor(all_numVar, use="pairwise.complete.obs") #correlations of all numeric variables
+
+#sort on decreasing correlations with SalePrice
+cor_sorted <- as.matrix(sort(cor_numVar[,'SalePrice'], decreasing = TRUE))
+ #select only high corelations
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.5)))
+cor_numVar <- cor_numVar[CorHigh, CorHigh]
+
+corrplot.mixed(cor_numVar, tl.col="black", tl.pos = "lt", tl.cex = 0.7,cl.cex = .7, number.cex=.7)
+```
+
+### 5.2 - Finding Feature Importance with quick Random Forest
+Although the correlations are giving a good overview of the most important numeric features and multicolinerity among those features, let's get an overview of the most important features including the categorical variables before moving on to detailed visualization.
+```{r }
+set.seed(123)
+quick_RF <- randomForest(x=allData[1:trainingRowIndex,-79], y=allData$SalePrice[1:trainingRowIndex], ntree=100, importance=TRUE)
+imp_RF <- importance(quick_RF)
+imp_DF <- data.frame(Variables = row.names(imp_RF), MSE = imp_RF[,1])
+imp_DF <- imp_DF[order(imp_DF$MSE, decreasing = TRUE),]
+
+ggplot(imp_DF[1:20,], aes(x=reorder(Variables, MSE), y=MSE, fill=MSE)) + geom_bar(stat = 'identity') + labs(x = 'Variables', y= '% increase MSE if variable is randomly permuted') + coord_flip() + theme(legend.position="none")
+```
+we can observe only 3 of those most important variables are categorical according to RF i.e. Neighborhood, MSSubClass, and GarageType. Let's now look into the detailed visualization of some of the features one by one.
+
+### 5.3 - Detailed EDA of Features {.tabset}
+#### 5.3.1 - Numerical Atrributes Distribution
+Let's look into the distribution of some numerical features. If the distribution is skewed then we log transform skewed variables in the model so that the data is normally distributed and modelling the data will provide better model performance. We can perform this on all the numerical features
+```{r }
+ggplot(allData[!is.na(allData$SalePrice),], aes(SalePrice)) + geom_histogram(aes(y = ..density..)) +
+  stat_function(fun = dnorm, color = "red", args = list(mean = mean(allData$SalePrice), sd = sd(allData$SalePrice))) +
+  ggtitle("Plot of SalePrice Distribution") + theme(plot.title = element_text(size = 11))
+
+ggplot(allData[!is.na(allData$SalePrice),], aes(log(SalePrice))) + geom_histogram(aes(y = ..density..)) +
+  stat_function(fun = dnorm, color = "red", args = list(mean = mean(log(allData$SalePrice)),
+                                                        sd = sd(log(allData$SalePrice)))) + 
+  ggtitle("Plot of log(SalePrice) Distribution") + theme(plot.title = element_text(size = 11))
+
+ggplot(allData, aes(LotFrontage)) + geom_histogram(aes(y = ..density..)) +
+  stat_function(fun = dnorm, color = "red", args = list(mean = mean(allData$LotFrontage),
+                                                        sd = sd(allData$LotFrontage))) +
+  ggtitle("Plot of LotFrontage Distribution") + theme(plot.title = element_text(size = 11))
+
+ggplot(allData, aes(log(LotFrontage))) + geom_histogram(aes(y = ..density..)) +
+  stat_function(fun = dnorm, color = "red", args = list(mean = mean(log(allData$LotFrontage)),
+                                                        sd = sd(log(allData$LotFrontage)))) + 
+  ggtitle("Plot of log(LotFrontage) Distribution") + theme(plot.title = element_text(size = 11))
+```
+As we see numerical features tend to skew, hence, we need to handle them through log transformations.
+
+#### 5.3.2 - EDA on Neighborhood
+```{r }
+group.mean.prices('Neighborhood')
+group.median.prices('Neighborhood')
+```
+Both the median and mean Saleprices agree on 3 neighborhoods with substantially higher saleprices and 3 relatively poor neighborhoods. So, let's not create too many bins, hence, creating categories for those 'extremes'.
+```{r }
+allData$NeighborhoodBin[allData$Neighborhood %in% c('StoneBr', 'NridgHt', 'NoRidge')] <- 2
+allData$NeighborhoodBin[!allData$Neighborhood %in% c('MeadowV', 'IDOTRR', 'BrDale', 'StoneBr', 'NridgHt', 'NoRidge')] <- 1
+allData$NeighborhoodBin[allData$Neighborhood %in% c('MeadowV', 'IDOTRR', 'BrDale')] <- 0
+```
+
+#### 5.3.3 - EDA on MSSubClass
+```{r }
+group.mean.prices('MSSubClass')
+plot.categoric('MSSubClass', allData)
+```
+
+#### 5.3.4 - EDA on GarageYrBlt
+There is an entry with Garage Year Built as 2207, however that must be an typo, also, Year Built is 2006 and Year Remodel is 2007. So, we can put Garage Built Year as 2007.
+```{r }
+allData[allData$GarageYrBlt>2010, c('GarageYrBlt', 'YearBuilt', 'YearRemodAdd')]
+allData$GarageYrBlt[2593] <- 2007
+```
+
+### 5.4 - Feature Engineering {.tabset}
+#### 5.4.1 - Total number of Bathrooms
+There are 4 bathroom features Individually, these features are not very important. However, I assume that I if I add them up into one predictor, this predictor is likely to become a strong one.
+```{r }
+allData$TotBathrooms <- allData$FullBath + (allData$HalfBath*0.5) + allData$BsmtFullBath + (allData$BsmtHalfBath*0.5)
+
+ggplot(data=allData[!is.na(allData$SalePrice),], aes(x=TotBathrooms, y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+```
+
+#### 5.4.2 - Features Based on YearBuilt, YrSold & YearRemodAdd
+Altogether, there are 3 features that are relevant with regards to the Age of a house; YearBlt, YearRemodAdd, and YearSold. YearRemodAdd defaults to YearBuilt if there has been no Remodeling/Addition.
+```{r }
+allData$Remod <- ifelse(allData$YearBuilt==allData$YearRemodAdd, 0, 1) #0=No Remodeling, 1=Remodeling
+allData$HouseAge <- as.numeric(allData$YrSold)-allData$YearRemodAdd
+allData$IsNew <- ifelse(allData$YrSold==allData$YearBuilt, 1, 0)
+
+allData$YrSold <- as.factor(allData$YrSold)
+```
+
+#### 5.4.3 - Total Square Feet
+As the total living space generally is very important when people buy houses, I am adding a predictors that adds up the living space above and below ground. Also, we have seen the outliers above w.r.t. GrLivArea feature, let's handle them.
+```{r }
+allData$TotalSqFeet <- allData$GrLivArea + allData$TotalBsmtSF
+
+ggplot(data=allData[!is.na(allData$SalePrice),], aes(x=TotalSqFeet, y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(allData$GrLivArea[!is.na(allData$SalePrice)]>4500, rownames(allData), '')))
+
+allData <- allData[-c(524, 1299),] # Removing outliers
+```
+
+#### 5.4.4 - Consolidating Porch Features
+As the total living space generally is very important when people buy houses, I am adding a predictors that adds up the living space above and below ground. Also, we have seen the outliers above w.r.t. GrLivArea feature, let's handle them.
+```{r }
+allData$TotalPorchSF <- allData$OpenPorchSF + allData$EnclosedPorch + allData$X3SsnPorch + allData$ScreenPorch
+
+ggplot(data=allData[!is.na(allData$SalePrice),], aes(x=TotalPorchSF, y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+```
+
+## 6 - Preparing Data for Model
+### 6.1 - Dropping Highly Correlated Features
+Let's drop feature if two features are highly correlated.
+```{r }
+dropVars <- c('YearRemodAdd', 'GarageYrBlt', 'GarageArea', 'GarageCond', 'TotalBsmtSF', 'TotalRmsAbvGrd', 'BsmtFinSF1')
+
+allData <- allData[,!(names(allData) %in% dropVars)]
+```
+
+### 6.2 - PreProcessing Predictor Features
+Let's drop feature if two features are highly correlated.
+```{r }
+numericVarNames <- numericVarNames[!(numericVarNames %in% c('MSSubClass', 'MoSold', 'YrSold', 'SalePrice', 'OverallQual', 'OverallCond'))] #numericVarNames was created before having done anything
+numericVarNames <- append(numericVarNames, c('Age', 'TotalPorchSF', 'TotBathrooms', 'TotalSqFeet'))
+
+numeric_df <- allData[, names(allData) %in% numericVarNames]
+
+faactor_df <- allData[, !(names(allData) %in% numericVarNames)]
+faactor_df <- faactor_df[, names(faactor_df) != 'SalePrice']
+
+cat('There are', length(numeric_df), 'numeric variables, and', length(faactor_df), 'factor variables')
+```
+
+### 6.3 - Skewness and Normalizing of the Numeric Features
+As a rule of thumb, skewness should be between -1 and 1. In this range, data are considered fairly symmetrical. In order to fix the skewness,let's take the log for all numeric predictors with an absolute skew greater than 0.8 (actually: log+1, to avoid division by zero issues).
+```{r }
+# Remove high skewness
+for(i in 1:ncol(numeric_df)){
+        if (abs(skew(numeric_df[,i]))>0.8){
+                numeric_df[,i] <- log(numeric_df[,i] +1)
+        }
+}
+
+# Normalizing the data
+PreNum <- preProcess(numeric_df, method=c("center", "scale"))
+
+norm_df <- predict(PreNum, numeric_df)
+dim(norm_df)
+```
+
+### 6.4 - One Hot Encoding the Categorical Features
+Ensure that all predictors are converted into numeric columns. We can achieve this through 'one-hot encode' of the categorical features. This basically means that all (not ordinal) factor values are getting a seperate colums with 1s and 0s (1 basically means Yes/Present). To do this one-hot encoding, we will be using the model.matrix() function.
+```{r }
+dummies_df <- as.data.frame(model.matrix(~.-1, faactor_df))
+dim(dummies_df)
+```
+
+### 6.5 - Removing levels with few or no Observations
+```{r }
+#check if some values are absent in the test set
+#ZerocolTest <- which(colSums(dummies_df[(nrow(allData[!is.na(allData$SalePrice),])+1):nrow(allData),])==0)
+#colnames(dummies_df[ZerocolTest])
+
+#dummies_df <- dummies_df[,-ZerocolTest] #removing predictors
+
+#check if some values are absent in the train set
+#ZerocolTrain <- which(colSums(dummies_df[1:nrow(allData[!is.na(allData$SalePrice),]),])==0)
+#colnames(dummies_df[ZerocolTrain])
+
+#dummies_df <- dummies_df[,-ZerocolTrain] #removing predictor
+
+# taking out variables with less than 10 'ones' in the train set.
+#fewOnes <- which(colSums(dummies_df[1:nrow(allData[!is.na(allData$SalePrice),]),])<10)
+#colnames(dummies_df[fewOnes])
+
+#dummies_df <- dummies_df[,-fewOnes] #removing predictors
+dim(dummies_df)
+```
+
+### 6.6 - Target SalePrice Skewness
+```{r }
+skew(allData$SalePrice)
+
+allData$SalePrice <- log(allData$SalePrice) #default is the natural logarithm, "+1" is not necessary as there are no 0's
+skew(allData$SalePrice)
+```
+
+### 6.7 - Split into Train & Test
+```{r }
+combined_df <- cbind(norm_df, dummies_df) #combining all (now numeric) predictors into one dataframe 
+
+final_train <- combined_df[!is.na(allData$SalePrice),]
+targetSalePrice <- allData$SalePrice[!is.na(allData$SalePrice)]
+final_train$SalePrice <- targetSalePrice
+
+final_test <- combined_df[is.na(allData$SalePrice),]
+```
+
+## 7 - Build Model & Predict on Test Dataset
+
+### 7.1 - Prepare Basic Prediction Model & Identify Best {.tabset}
+
+```{r }
+set.seed(456)
+myControl <- trainControl(method="cv", number=5)
+myMetric <- "RMSE"
+```
+
+#### 7.1.1 - Linear Regression Model
+```{r }
+lm_mod = train(SalePrice ~ ., data=final_train, method="lm", trControl=myControl, metric=myMetric)
+```
+
+#### 7.1.2 - Lasso Regression Model
+```{r }
+lassoGrid <- expand.grid(alpha = 1, lambda = 0.005)
+
+lasso_mod <- train(SalePrice ~ ., data=final_train, method='glmnet', trControl= myControl, tuneGrid=lassoGrid, metric=myMetric) 
+```
+
+#### 7.1.3 - Random Forest
+```{r }
+mtry <- sqrt(ncol(final_train))
+RFtunegrid <- expand.grid(.mtry=mtry)
+
+rf_mod = train(SalePrice ~ ., data=final_train, method="rf", tuneGrid=RFtunegrid, ntree=100, trControl=myControl, metric=myMetric)
+```
+
+#### 7.1.4 - eXtreme Gradient Boosting
+```{r }
+XGBtunegrid <- expand.grid(nrounds=750, max_depth=8, eta=0.01, colsample_bytree=1, min_child_weight=2, subsample=0.6, gamma=0.01)
+
+xgb_mod = train(SalePrice ~ ., data=final_train, method="xgbTree", tuneGrid=XGBtunegrid, trControl=myControl, metric=myMetric, verbose=T, nthread =3)
+```
+
+#### 7.1.5 - Identifying Best Model
+```{r }
+model_list = list(lm=lm_mod, lasso=lasso_mod, rf=rf_mod, xgboost=xgb_mod)
+resamples = resamples(model_list)
+summary(resamples)
+```
+
+### 7.2 - Tuning Best Models & Identify Best Parameters {.tabset}
+
+#### 7.2.1 - Tuning Lasso Regression Model
+```{r }
+#lassoGridTune <- expand.grid(alpha = 1, lambda = seq(0.001,0.1,by = 0.0005))
+
+#lasso_tune_mod <- train(SalePrice ~ ., data=final_train, method='glmnet', trControl= myControl, tuneGrid=lassoGridTune, metric=myMetric) 
+
+#lasso_tune_mod$bestTune
+#min(lasso_tune_mod$results$RMSE)
+```
+Best Parameters are alpha=1, lambda=0.003 with RMSE score of 0.1145103
+
+#### 7.2.2 - Tuning Random Forest Model
+```{r }
+#mtry <- sqrt(ncol(final_train))
+#RFGridTune <- expand.grid(.mtry=c(1:15))
+#myntree <- c(500, 1000, 1500, 2000)
+
+#RFmodelList <- list()
+
+#for (ntree in c(500, 1000, 1500, 2000)) {
+#  RFfit <- train(SalePrice ~ ., data=final_train, method="rf", metric=myMetric, tuneGrid=RFGridTune, trControl=myControl, ntree=ntree)
+#  key <- toString(ntree)
+#  RFmodelList[[key]] <- RFfit
+#}
+
+# compare results
+#results <- resamples(RFmodelList)
+#summary(results)
+```
+Best Parameters are ntree = 1000 with RMSE as 0.1327077
+
+#### 7.2.3 - Tuning XGBoost Model
+```{r }
+#xgbGridTune = expand.grid(nrounds = 1000,
+#                       eta = c(0.1, 0.05, 0.01),
+#                       max_depth = c(2, 3, 4, 5, 6),
+#                       gamma = 0,
+#                       colsample_bytree=1,
+#                       min_child_weight=c(1, 2, 3, 4 ,5),
+#                       subsample=1
+#                       )
+
+#xgb_tune_mod <- train(SalePrice ~ ., data=final_train, method='xgbTree', trControl= myControl, tuneGrid=xgbGridTune, metric=myMetric) 
+
+#xgb_tune_mod$bestTune
+#min(xgb_tune_mod$results$RMSE)
+```
+Best Parameters are nrounds=1000, max_depth=3, gamma=0, eta=0.05, colsample_bytree=1, min_child_weight=4, subsample=1 with RMSE score of 0.1156953
+
+#### 7.2.4 - Tuning Elastic Regression Model
+```{r }
+#elasticGridTune <- expand.grid(alpha = seq(0, 1, by=0.1), lambda = seq(0.001, 0.1,by = 0.0005))
+
+#elastic_tune_mod <- train(SalePrice ~ ., data=final_train, method='glmnet', trControl= myControl, tuneGrid=elasticGridTune, metric=myMetric) 
+
+#elastic_tune_mod$bestTune
+#min(elastic_tune_mod$results$RMSE)
+```
+Best Parameters are alpha=0.3 & lambda=0.001 with RMSE score of 0.1142889 which is best of all.
+
+#### 7.2.5 - Tuning Gradient Boosting Model
+```{r }
+#gbmGridTune <- expand.grid(interaction.depth = c(1, 3, 5, 8), n.trees = c(1000, 1500, 2000, 2500),
+#                           shrinkage = seq(0.001, 0.05, 0.0005),
+#                           n.minobsinnode = c(5, 10, 15, 20))
+
+#gbm_tune_mod <- train(SalePrice ~ ., data=final_train, distribution="gaussian", method="gbm",
+#                      trControl=myControl, verbose=FALSE, 
+#                      tuneGrid=gbmGridTune, metric=myMetric, bag.fraction=0.75)
+
+#gbm_tune_mod$bestTune
+#min(gbm_tune_mod$results$RMSE)
+```
+Didn't try as it takes too much time. :)
+
+### 7.3 - Prepare Model with Best Parameters & Run Predictions on Test Dataset {.tabset}
+
+#### 7.3.1 - Best Tuned Lasso Regression Model
+```{r }
+lassoGrid <- expand.grid(alpha = 1, lambda = 0.003)
+final_lasso_mod <- train(SalePrice ~ ., data=final_train, method='glmnet', trControl= myControl, tuneGrid=lassoGrid, metric=myMetric)
+
+cat('RMSE of Tuned Lasso Regression Model is ', final_lasso_mod$results$RMSE)
+
+LassoPred <- predict(final_lasso_mod, final_test)
+predictions_lasso <- exp(LassoPred) #need to reverse the log to the real values
+head(predictions_lasso)
+```
+
+#### 7.3.2 - Best Tuned XGBoost Model
+```{r }
+XGBtunegrid <- expand.grid(nrounds=1000, max_depth=3, eta=0.05, colsample_bytree=1, min_child_weight=4, subsample=1, gamma=0)
+
+final_xgb_mod = train(SalePrice ~ ., data=final_train, method="xgbTree", tuneGrid=XGBtunegrid, trControl=myControl, metric=myMetric, verbose=T, nthread =3)
+
+cat('RMSE of Tuned Lasso Regression Model is ', final_xgb_mod$results$RMSE)
+
+XGBpred <- predict(final_xgb_mod, final_test)
+predictions_XGB <- exp(XGBpred) #need to reverse the log to the real values
+head(predictions_XGB)
+```
+
+#### 7.3.3 - Best Tuned Elastic Regression Model
+```{r }
+elasticGridTune <- expand.grid(alpha = 0.3, lambda = 0.01)
+
+final_elastic_mod <- train(SalePrice ~ ., data=final_train, method='glmnet', trControl= myControl, tuneGrid=elasticGridTune, metric=myMetric) 
+
+cat('RMSE of Tuned Elastic Regression Model is ', final_elastic_mod$results$RMSE)
+
+elaspred <- predict(final_elastic_mod, final_test)
+predictions_elas <- exp(elaspred) #need to reverse the log to the real values
+head(predictions_elas)
+```
+
+#### 7.3.4 - Averaging Predictions
+Since the lasso and XGBoost algorithms are very different, averaging predictions likely improves the scores. As the lasso model does better regarding the cross validated RMSE score (0.1155072 versus 0.1174297), I am weigting the lasso model double.
+```{r }
+sub_avg <- data.frame(Id = testLabels, SalePrice = (predictions_XGB+2*predictions_lasso)/3)
+head(sub_avg)
+
+# Write Predictions of Test Datset into csv file
+write.csv(sub_avg, "sample_submission.csv", row.names=FALSE)
+```
